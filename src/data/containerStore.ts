@@ -33,6 +33,9 @@ export interface SuggestedPosition {
   sizeType: '20ft' | '40ft';
   efficiency: number;
   moves: number;
+  // Phase 5: populated by backend recommendation, used for position assignment
+  slotId?:  number;
+  blockId?: number;
 }
 
 // ─── Store ──────────────────────────────────────────────────────────────────
@@ -54,9 +57,12 @@ export function getImportedContainers(): ImportedContainer[] {
   return importedContainers;
 }
 
-export function addImportedContainer(ctn: ImportedContainer): void {
-  importedContainers = [ctn, ...importedContainers];
+/** @deprecated Phase 5 — replaced by confirmGateIn() in gateInService. */
+export function addImportedContainer(_ctn: ImportedContainer): void {
+  /* Phase 5: body commented out — real gate-in is handled by gateInService.confirmGateIn()
+  importedContainers = [_ctn, ...importedContainers];
   notify();
+  */
 }
 
 /** Get recent container codes for a specific warehouse, most recent first */
@@ -84,17 +90,17 @@ function cargoTypeToWHName(cargoType: string): string {
   return wh?.name ?? 'Kho Khô';
 }
 
-export function findSuggestedPosition(cargoType: string, preferredSize: '20ft' | '40ft' = '20ft'): SuggestedPosition | null {
-  const whType = cargoTypeToWHType(cargoType);
-  const whName = cargoTypeToWHName(cargoType);
+/** @deprecated Phase 5 — replaced by fetchRecommendation() in gateInService. */
+export function findSuggestedPosition(_cargoType: string, _preferredSize: '20ft' | '40ft' = '20ft'): SuggestedPosition | null {
+  /* Phase 5: body commented out — recommendation now comes from POST /admin/optimization/recommend
+  const whType = cargoTypeToWHType(_cargoType);
+  const whName = cargoTypeToWHName(_cargoType);
 
-  // Search zones in order, prefer lower floors, find first empty slot matching preferred size
   for (const zone of ZONES) {
     for (let floor = 1; floor <= 3; floor++) {
       const grid = getGridForFloor(whType, zone, floor);
 
-      if (preferredSize === '20ft') {
-        // Check 20ft slots (cols 0-3)
+      if (_preferredSize === '20ft') {
         for (let row = 0; row < 4; row++) {
           for (let col = 0; col < 4; col++) {
             if (grid[row][col]) continue;
@@ -106,19 +112,12 @@ export function findSuggestedPosition(cargoType: string, preferredSize: '20ft' |
               (c) => c.whType === whType && c.zone === zone && c.floor === floor && c.row === row && c.col === col
             );
             if (taken) continue;
-
             const efficiency = Math.round(85 + Math.random() * 12);
-            return {
-              whType, whName, zone, floor, row, col,
-              slot: `R${row + 1}C${col + 1}`,
-              sizeType: '20ft',
-              efficiency,
-              moves: 0,
-            };
+            return { whType, whName, zone, floor, row, col,
+              slot: `R${row + 1}C${col + 1}`, sizeType: '20ft', efficiency, moves: 0 };
           }
         }
       } else {
-        // Check 40ft slots (cols 4-7)
         for (let groupIdx = 0; groupIdx < 2; groupIdx++) {
           const baseRow = groupIdx * 2;
           for (let col = 4; col < 8; col++) {
@@ -131,22 +130,15 @@ export function findSuggestedPosition(cargoType: string, preferredSize: '20ft' |
               (c) => c.whType === whType && c.zone === zone && c.floor === floor && c.row === baseRow && c.col === col
             );
             if (taken) continue;
-
             const efficiency = Math.round(85 + Math.random() * 12);
-            return {
-              whType, whName, zone, floor,
-              row: baseRow, col,
-              slot: `R${baseRow + 1}-R${baseRow + 2}C${col + 1}`,
-              sizeType: '40ft',
-              efficiency,
-              moves: 0,
-            };
+            return { whType, whName, zone, floor, row: baseRow, col,
+              slot: `R${baseRow + 1}-R${baseRow + 2}C${col + 1}`, sizeType: '40ft', efficiency, moves: 0 };
           }
         }
       }
     }
   }
-
+  */
   return null;
 }
 

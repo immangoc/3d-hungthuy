@@ -99,6 +99,11 @@ interface ContainerBlockProps {
   floor?: number;
   slot?: string;
   highlightId?: string;
+  // Phase 4: real data props (optional — falls back to mock if not provided)
+  cargoType?:      string;
+  weight?:         string;
+  gateInDate?:     string;
+  storageDuration?: string;
 }
 
 export function ContainerBlock({
@@ -111,6 +116,10 @@ export function ContainerBlock({
   floor = 1,
   slot = 'CT01',
   highlightId,
+  cargoType,
+  weight,
+  gateInDate,
+  storageDuration,
 }: ContainerBlockProps) {
   const LENGTH = sizeType === '40ft' ? 12.5 : 6.0;
   const color = getContainerColor(colorSeed);
@@ -140,7 +149,11 @@ export function ContainerBlock({
     }
   });
 
-  const vLabel = `Zone ${zone} - ${statusLabel[status]} - Tầng ${floor} - ${slot}`;
+  const vLabel          = `Zone ${zone} - ${statusLabel[status]} - Tầng ${floor} - ${slot}`;
+  const displayCargo    = cargoType      ?? `${sizeType} - ${statusLabel[status]}`;
+  const displayWeight   = weight         ?? '—';
+  const displayGateIn   = gateInDate     ?? '—';
+  const displayDuration = storageDuration ?? '—';
 
   return (
     <group position={position}>
@@ -204,11 +217,12 @@ export function ContainerBlock({
                 <tbody>
                   {[
                     { label: 'Mã số Container:', value: id },
-                    { label: 'Loại Container:', value: `${sizeType} - ${statusLabel[status]}` },
+                    { label: 'Loại hàng:', value: displayCargo },
+                    { label: 'Trọng lượng:', value: displayWeight },
                     { label: 'Trạng thái:', value: 'Lưu kho', style: { color: '#F97316', fontWeight: '600' as const } },
                     { label: 'Vị trí:', value: vLabel, style: { fontWeight: '700' as const, color: '#111827' } },
-                    { label: 'Ngày nhập bãi:', value: '20/01/2026' },
-                    { label: 'Thời gian lưu kho:', value: '2 tháng' },
+                    { label: 'Ngày nhập bãi:', value: displayGateIn },
+                    { label: 'Thời gian lưu kho:', value: displayDuration },
                   ].map(({ label, value, style }) => (
                     <tr key={label}>
                       <td style={{ color: '#6B7280', paddingBottom: '5px', paddingRight: '8px', whiteSpace: 'nowrap', verticalAlign: 'top' }}>

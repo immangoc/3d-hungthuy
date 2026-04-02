@@ -5,15 +5,22 @@ import * as THREE from 'three';
 import { ContainerBlock } from './ContainerBlock';
 import { GhostContainer } from './GhostContainer';
 import {
-  ZONES, TOTAL_SLOTS, WARNING_THRESHOLD,
-  WH_MAP, getGrid, countFilledSlots,
+  // Phase 3: ZONES, getGrid, countFilledSlots replaced by yardStore
+  TOTAL_SLOTS, WARNING_THRESHOLD, WH_MAP,
 } from '../../data/warehouse';
 import type { WHType, ZoneInfo, PreviewPosition } from '../../data/warehouse';
 import { subscribe, getImportedContainers } from '../../data/containerStore';
+import {
+  subscribeYard, getYardData,
+  getZoneNames, getZoneGrid, countZoneFilledSlots, getZoneTotalSlots, getZoneDims,
+} from '../../store/yardStore';
+import {
+  subscribeOccupancy, getOccupancyData,
+  getSlotOccupancy, countOccupiedZoneSlots, isOccupancyFetched,
+} from '../../store/occupancyStore';
 
-// Re-export types and values used by other files
+// Re-export types used by other files
 export type { WHType, ZoneInfo };
-export { WH_MAP as WH_CONFIG, TOTAL_SLOTS, countFilledSlots };
 
 export interface SceneHandle {
   zoomIn: () => void;
@@ -99,9 +106,16 @@ interface ZoneBlockProps {
 
 function ZoneBlock({ position, zoneName, whType, onClick, highlightId, previewPosition }: ZoneBlockProps) {
   const wh = WH_MAP[whType];
-  const grid = useMemo(() => getGrid(whType, zoneName), [whType, zoneName]);
-  const filledCount = useMemo(() => countFilledSlots(whType, zoneName), [whType, zoneName]);
-  const isWarning = filledCount / TOTAL_SLOTS >= WARNING_THRESHOLD;
+  const allYards     = useSyncExternalStore(subscribeYard, getYardData);
+  const occupancyMap = useSyncExternalStore(subscribeOccupancy, getOccupancyData);
+  const occupancyLoaded = isOccupancyFetched();
+
+  const grid       = getZoneGrid(allYards, whType, zoneName);
+  const totalSlots = getZoneTotalSlots(allYards, whType, zoneName);
+  const filledCount = occupancyLoaded
+    ? countOccupiedZoneSlots(occupancyMap, whType, zoneName)
+    : countZoneFilledSlots(allYards, whType, zoneName);
+  const isWarning = filledCount / totalSlots >= WARNING_THRESHOLD;
 
   // Imported containers from store
   const allImported = useSyncExternalStore(subscribe, getImportedContainers);
@@ -119,72 +133,129 @@ function ZoneBlock({ position, zoneName, whType, onClick, highlightId, previewPo
       floor: number;
       slot: string;
       colorSeed: number;
+      cargoType?: string;
+      weight?: string;
+      gateInDate?: string;
+      storageDuration?: string;
     }[] = [];
 
-    const maxLevels = 3;
-    const sr = (n: number) => {
-      const x = Math.sin(n * 31.7 + ZONES.indexOf(zoneName) * 7.3) * 43758.5453;
-      return x - Math.floor(x);
-    };
+    const { rows: gridRows, cols: gridCols, maxTier } = getZoneDims(allYards, whType, zoneName);
+    const midCol    = Math.floor(gridCols / 2);
+    const numGroups = Math.floor(gridRows / 2);
+    const maxLevels = maxTier || 3;
 
-    // Track which slots are filled per level (containers can only stack on top of existing ones)
-    const filled20: Set<string>[] = [new Set(), new Set(), new Set()];
-    const filled40: Set<string>[] = [new Set(), new Set(), new Set()];
+    if (occupancyLoaded) {
+      // Phase 4: render only real occupied slots
+      for (let tier = 1; tier <= maxLevels; tier++) {
+        for (let row = 0; row < gridRows; row++) {
+          for (let col = 0; col < gridCols; col++) {
+            if (!grid[row]?.[col]) continue;
+            const occ = getSlotOccupancy(occupancyMap, whType, zoneName, row, col, tier);
+            if (!occ) continue;
 
-    for (let level = 0; level < maxLevels; level++) {
-      const fillRate = level === 0 ? 1.0 : level === 1 ? 0.6 : 0.3;
+            const is40ft = col >= midCol;
+            const y = (tier - 1) * CTN_H + CTN_H / 2;
+            const x = colX(col);
 
-      // 20ft containers (cols 0-3)
-      for (let row = 0; row < 4; row++) {
-        for (let col = 0; col < 4; col++) {
-          const slotKey = `${row}-${col}`;
-          if (!grid[row][col]) continue;
-          // Level 0: place based on grid. Level 1+: MUST have container below, then random check
-          if (level > 0 && !filled20[level - 1].has(slotKey)) continue;
-          if (level > 0 && sr(level * 100 + row * 10 + col) > fillRate) continue;
-
-          filled20[level].add(slotKey);
-          items.push({
-            key: `20-${level}-${row}-${col}`,
-            pos: [colX(col), level * CTN_H + CTN_H / 2, rowZ(row)],
-            sizeType: '20ft',
-            id: `CTN-${whType.charAt(0).toUpperCase()}${zoneName.replace('Zone ', '')}-F${level + 1}-R${row + 1}C${col + 1}`,
-            floor: level + 1,
-            slot: `R${row + 1}C${col + 1}`,
-            colorSeed: level * 1000 + row * 100 + col * 10 + ZONES.indexOf(zoneName) * 3,
-          });
+            if (is40ft) {
+              const baseRow = row % 2 === 0 ? row : row - 1;
+              const nextRow = Math.min(baseRow + 1, gridRows - 1);
+              const z = (rowZ(baseRow) + rowZ(nextRow)) / 2;
+              items.push({
+                key: `real-40-${tier}-${row}-${col}`,
+                pos: [x, y, z],
+                sizeType: '40ft',
+                id: occ.containerCode || `CTN-${whType.charAt(0).toUpperCase()}${zoneName.replace('Zone ', '')}-F${tier}-R${baseRow + 1}C${col + 1}`,
+                floor: tier,
+                slot: `R${baseRow + 1}-${baseRow + 2}C${col + 1}`,
+                colorSeed: occ.containerId,
+                cargoType:       occ.cargoType,
+                weight:          occ.weight,
+                gateInDate:      occ.gateInDate,
+                storageDuration: occ.storageDuration,
+              });
+            } else {
+              items.push({
+                key: `real-20-${tier}-${row}-${col}`,
+                pos: [x, y, rowZ(row)],
+                sizeType: '20ft',
+                id: occ.containerCode || `CTN-${whType.charAt(0).toUpperCase()}${zoneName.replace('Zone ', '')}-F${tier}-R${row + 1}C${col + 1}`,
+                floor: tier,
+                slot: `R${row + 1}C${col + 1}`,
+                colorSeed: occ.containerId,
+                cargoType:       occ.cargoType,
+                weight:          occ.weight,
+                gateInDate:      occ.gateInDate,
+                storageDuration: occ.storageDuration,
+              });
+            }
+          }
         }
       }
+    } else {
+      // Fallback: seeded fill-rate algorithm (mock data until occupancy loads)
+      const zoneIdx = getZoneNames(allYards, whType).indexOf(zoneName);
+      const sr = (n: number) => {
+        const x = Math.sin(n * 31.7 + zoneIdx * 7.3) * 43758.5453;
+        return x - Math.floor(x);
+      };
 
-      // 40ft containers (cols 4-7, each spans 2 rows)
-      for (let groupIdx = 0; groupIdx < 2; groupIdx++) {
-        const baseRow = groupIdx * 2;
-        for (let col = 4; col < 8; col++) {
-          const slotKey = `${groupIdx}-${col}`;
-          if (!grid[baseRow][col]) continue;
-          // Must have container below to stack
-          if (level > 0 && !filled40[level - 1].has(slotKey)) continue;
-          if (level > 0 && sr(level * 200 + groupIdx * 50 + col) > fillRate) continue;
+      const filled20: Set<string>[] = Array.from({ length: maxLevels }, () => new Set());
+      const filled40: Set<string>[] = Array.from({ length: maxLevels }, () => new Set());
 
-          filled40[level].add(slotKey);
-          const z0 = rowZ(baseRow);
-          const z1 = rowZ(baseRow + 1);
+      for (let level = 0; level < maxLevels; level++) {
+        const fillRate = level === 0 ? 1.0 : level === 1 ? 0.6 : 0.3;
 
-          items.push({
-            key: `40-${level}-${groupIdx}-${col}`,
-            pos: [colX(col), level * CTN_H + CTN_H / 2, (z0 + z1) / 2],
-            sizeType: '40ft',
-            id: `CTN-${whType.charAt(0).toUpperCase()}${zoneName.replace('Zone ', '')}-F${level + 1}-R${baseRow + 1}C${col + 1}`,
-            floor: level + 1,
-            slot: `R${baseRow + 1}-${baseRow + 2}C${col + 1}`,
-            colorSeed: level * 1000 + groupIdx * 200 + col * 10 + 5 + ZONES.indexOf(zoneName) * 3,
-          });
+        // 20ft containers (cols 0 .. midCol-1)
+        for (let row = 0; row < gridRows; row++) {
+          for (let col = 0; col < midCol; col++) {
+            const slotKey = `${row}-${col}`;
+            if (!grid[row]?.[col]) continue;
+            if (level > 0 && !filled20[level - 1].has(slotKey)) continue;
+            if (level > 0 && sr(level * 100 + row * 10 + col) > fillRate) continue;
+
+            filled20[level].add(slotKey);
+            items.push({
+              key: `20-${level}-${row}-${col}`,
+              pos: [colX(col), level * CTN_H + CTN_H / 2, rowZ(row)],
+              sizeType: '20ft',
+              id: `CTN-${whType.charAt(0).toUpperCase()}${zoneName.replace('Zone ', '')}-F${level + 1}-R${row + 1}C${col + 1}`,
+              floor: level + 1,
+              slot: `R${row + 1}C${col + 1}`,
+              colorSeed: level * 1000 + row * 100 + col * 10 + zoneIdx * 3,
+            });
+          }
+        }
+
+        // 40ft containers (cols midCol .. gridCols-1, each spans 2 rows)
+        for (let groupIdx = 0; groupIdx < numGroups; groupIdx++) {
+          const baseRow = groupIdx * 2;
+          for (let col = midCol; col < gridCols; col++) {
+            const slotKey = `${groupIdx}-${col}`;
+            if (!grid[baseRow]?.[col]) continue;
+            if (level > 0 && !filled40[level - 1].has(slotKey)) continue;
+            if (level > 0 && sr(level * 200 + groupIdx * 50 + col) > fillRate) continue;
+
+            filled40[level].add(slotKey);
+            const z0 = rowZ(baseRow);
+            const z1 = rowZ(baseRow + 1);
+
+            items.push({
+              key: `40-${level}-${groupIdx}-${col}`,
+              pos: [colX(col), level * CTN_H + CTN_H / 2, (z0 + z1) / 2],
+              sizeType: '40ft',
+              id: `CTN-${whType.charAt(0).toUpperCase()}${zoneName.replace('Zone ', '')}-F${level + 1}-R${baseRow + 1}C${col + 1}`,
+              floor: level + 1,
+              slot: `R${baseRow + 1}-${baseRow + 2}C${col + 1}`,
+              colorSeed: level * 1000 + groupIdx * 200 + col * 10 + 5 + zoneIdx * 3,
+            });
+          }
         }
       }
     }
 
     return items;
-  }, [grid, whType, zoneName]);
+  }, [grid, allYards, occupancyMap, occupancyLoaded, whType, zoneName]);
 
   const centerX = TOTAL_X / 2;
   const centerZ = TOTAL_Z / 2;
@@ -246,6 +317,8 @@ function ZoneBlock({ position, zoneName, whType, onClick, highlightId, previewPo
           id={ctn.id}
           position={ctn.pos}
           status={wh.status}
+          cargoType={ctn.cargoType} weight={ctn.weight}
+          gateInDate={ctn.gateInDate} storageDuration={ctn.storageDuration}
           sizeType={ctn.sizeType}
           colorSeed={ctn.colorSeed}
           zone={zoneName.replace('Zone ', '')}
@@ -374,7 +447,10 @@ const ZONE_SPACING = 34;
 
 export const WarehouseScene = forwardRef<SceneHandle, WarehouseSceneProps>(
   ({ warehouseType, onZoneClick, highlightId, previewPosition }, ref) => {
-    const handleRef = useRef<SceneHandle | null>(null);
+    const handleRef    = useRef<SceneHandle | null>(null);
+    const allYards     = useSyncExternalStore(subscribeYard, getYardData);
+    const occupancyMap = useSyncExternalStore(subscribeOccupancy, getOccupancyData);
+    const zones        = getZoneNames(allYards, warehouseType);
 
     useImperativeHandle(ref, () => ({
       zoomIn:    () => handleRef.current?.zoomIn(),
@@ -383,15 +459,18 @@ export const WarehouseScene = forwardRef<SceneHandle, WarehouseSceneProps>(
     }), []);
 
     function handleZoneClick(zoneName: string) {
-      const wh = WH_MAP[warehouseType];
-      const filledSlots = countFilledSlots(warehouseType, zoneName);
+      const wh           = WH_MAP[warehouseType];
+      const total        = getZoneTotalSlots(allYards, warehouseType, zoneName);
+      const occupiedSlots = isOccupancyFetched()
+        ? countOccupiedZoneSlots(occupancyMap, warehouseType, zoneName)
+        : countZoneFilledSlots(allYards, warehouseType, zoneName);
 
       onZoneClick({
         name: zoneName,
         type: wh.name,
-        fillRate: Math.round((filledSlots / TOTAL_SLOTS) * 100),
-        emptySlots: TOTAL_SLOTS - filledSlots,
-        totalSlots: TOTAL_SLOTS,
+        fillRate: total > 0 ? Math.round((occupiedSlots / total) * 100) : 0,
+        emptySlots: total - occupiedSlots,
+        totalSlots: total,
         recentContainers: wh.recentContainers,
       });
     }
@@ -417,8 +496,7 @@ export const WarehouseScene = forwardRef<SceneHandle, WarehouseSceneProps>(
 
             <ContactShadows position={[0, 0, 0]} opacity={0.3} scale={140} blur={2} far={10} />
 
-            {/* 3 zones arranged horizontally */}
-            {ZONES.map((zone, i) => (
+            {zones.map((zone, i) => (
               <ZoneBlock
                 key={`${warehouseType}-${zone}`}
                 position={[i * ZONE_SPACING, 0, 0]}

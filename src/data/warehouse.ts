@@ -64,8 +64,10 @@ export interface ExportContainer {
 }
 
 // ─── Constants ───────────────────────────────────────────────────────────────
+/** @deprecated Phase 3 — use getZoneNames() from yardStore. Kept as fallback. */
 export const ZONES = ['Zone A', 'Zone B', 'Zone C'];
 
+/** @deprecated Phase 3 — use getZoneTotalSlots() from yardStore. Kept as fallback. */
 export const TOTAL_SLOTS = 72; // 48 × 20ft + 24 × 40ft across 3 levels
 export const WARNING_THRESHOLD = 0.9;
 
@@ -110,17 +112,21 @@ export const WH_MAP: Record<WHType, WHConfig> = Object.fromEntries(
 export const FLOOR_MAP: Record<WHType, number> = { cold: 1, dry: 2, fragile: 1, other: 2 };
 
 // ─── Waiting containers ──────────────────────────────────────────────────────
-export const WAITING_CONTAINERS: WaitingContainer[] = [
+/** @deprecated Phase 6 — replaced by fetchWaitingContainers() in gateOutService. */
+/* export const WAITING_CONTAINERS: WaitingContainer[] = [
   { code: 'CTN-2026-1234', type: 'Hàng Khô',   date: '19/03/2026' },
   { code: 'CTN-2026-1235', type: 'Hàng Lạnh',  date: '19/03/2026' },
   { code: 'CTN-2026-1236', type: 'Hàng dễ vỡ', date: '18/03/2026' },
-];
+]; */
+export const WAITING_CONTAINERS: WaitingContainer[] = [];
 
 // ─── Export containers (in storage) ──────────────────────────────────────────
-export const EXPORT_CONTAINERS: ExportContainer[] = [
+/** @deprecated Phase 6 — replaced by searchInYardContainers() in gateOutService. */
+/* export const EXPORT_CONTAINERS: ExportContainer[] = [
   { code: 'CTN-2026-0987', type: 'Hàng Khô',  zone: 'Zone B', wh: 'Kho Khô',  floor: 2, slot: 'R1C3' },
   { code: 'CTN-2026-0654', type: 'Hàng Lạnh', zone: 'Zone A', wh: 'Kho Lạnh', floor: 1, slot: 'R2C1' },
-];
+]; */
+export const EXPORT_CONTAINERS: ExportContainer[] = [];
 
 // ─── Grid generation ─────────────────────────────────────────────────────────
 function makeGrid(seed: number): boolean[][] {
@@ -144,6 +150,7 @@ function makeGrid(seed: number): boolean[][] {
 const GRID_CACHE: Record<string, boolean[][]> = {};
 const SEEDS: Record<string, number> = { cold: 2.1, dry: 3.5, fragile: 5.7, other: 7.2 };
 
+/** @deprecated Phase 3 — use getZoneGrid() from yardStore. Kept as fallback. */
 export function getGrid(whId: string, zone: string): boolean[][] {
   const key = `${whId}-${zone}`;
   if (!GRID_CACHE[key]) {
@@ -156,6 +163,7 @@ export function getGrid(whId: string, zone: string): boolean[][] {
 // Get grid filtered by floor level (1-based). Floor 1 = base, Floor 2 = 60%, Floor 3 = 30%
 const FLOOR_GRID_CACHE: Record<string, boolean[][]> = {};
 
+/** @deprecated Phase 3 — use getZoneGridForFloor() from yardStore. Kept as fallback. */
 export function getGridForFloor(whId: string, zone: string, floor: number): boolean[][] {
   if (floor <= 1) return getGrid(whId, zone);
 
@@ -188,6 +196,7 @@ export function getGridForFloor(whId: string, zone: string, floor: number): bool
 }
 
 // ─── Count filled slots across 3 levels ──────────────────────────────────────
+/** @deprecated Phase 3 — use countZoneFilledSlots() from yardStore. Kept as fallback. */
 export function countFilledSlots(whType: string, zoneName: string): number {
   const grid = getGrid(whType, zoneName);
   const sr = (n: number) => {

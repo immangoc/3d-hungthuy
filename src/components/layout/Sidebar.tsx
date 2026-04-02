@@ -7,7 +7,14 @@ import {
   Anchor,
 } from 'lucide-react';
 import { NavLink, useLocation } from 'react-router-dom';
+import { useAuth } from '../../contexts/AuthContext';
 import './Sidebar.css';
+
+const ROLE_LABELS: Record<string, string> = {
+  ADMIN: 'Quản trị viên',
+  OPERATOR: 'Vận hành',
+  CUSTOMER: 'Khách hàng',
+};
 
 const navItems = [
   { icon: LayoutDashboard, label: 'Tổng quan', path: '/tong-quan' },
@@ -28,6 +35,10 @@ const navItems = [
 
 export function Sidebar() {
   const location = useLocation();
+  const user = useAuth();
+  const displayName = user?.username ?? 'Phạm Thị Lan';
+  const displayRole = ROLE_LABELS[user?.role ?? ''] ?? 'Vận hành';
+  const avatarChar = displayName.charAt(0).toUpperCase();
 
   return (
     <aside className="sidebar">
@@ -90,10 +101,10 @@ export function Sidebar() {
 
       <div className="sidebar-footer">
         <div className="user-profile">
-          <div className="avatar">P</div>
+          <div className="avatar">{avatarChar}</div>
           <div className="user-info">
-            <p className="user-name">Phạm Thị Lan</p>
-            <span className="user-role-badge">Vận hành</span>
+            <p className="user-name">{displayName}</p>
+            <span className="user-role-badge">{displayRole}</span>
           </div>
         </div>
       </div>

@@ -122,3 +122,12 @@ input, select, textarea {
 ::-webkit-scrollbar-thumb:hover {
   background: #9CA3AF;
 }
+
+@keyframes refresh-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+.refresh-spinning {
+  animation: refresh-spin 1s linear infinite;
+  display: inline-block;
+}

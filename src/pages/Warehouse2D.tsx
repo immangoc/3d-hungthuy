@@ -1,20 +1,36 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useSyncExternalStore } from 'react';
 import {
   Search, Plus, ChevronLeft, ChevronRight, ChevronDown,
   Snowflake, Package, AlertTriangle, Layers,
-  Thermometer, Truck, Calendar, Info, X,
+  Thermometer, Truck, Calendar, Info, X, RefreshCw,
 } from 'lucide-react';
 import { DashboardLayout } from '../components/layout/DashboardLayout';
 import {
-  ZONES, WAREHOUSES, WH_STATS,
-  WAITING_CONTAINERS, getGridForFloor, getSlotInfo,
+  WAREHOUSES,
+  // Phase 3: ZONES, getGridForFloor replaced by yardStore
+  // WH_STATS: Phase 2 — replaced by useDashboardStats hook
+  // Phase 6: WAITING_CONTAINERS replaced by fetchWaitingContainers
+  getSlotInfo,
 } from '../data/warehouse';
-import type { WHType, WHConfig, SlotInfo, PreviewPosition } from '../data/warehouse';
+import type { WHType, WHConfig, WHStat, SlotInfo, PreviewPosition } from '../data/warehouse';
+import { useDashboardStats } from '../hooks/useDashboardStats';
 import {
-  findSuggestedPosition, addImportedContainer,
+  subscribeYard, getYardData, getZoneNames, getZoneGrid, getZoneGridForFloor,
+} from '../store/yardStore';
+import {
+  subscribeOccupancy, getOccupancyData, getOccupancyBoolGrid,
+} from '../store/occupancyStore';
+import {
   cargoTypeToWHType, cargoTypeToWHName,
 } from '../data/containerStore';
 import type { SuggestedPosition } from '../data/containerStore';
+import { fetchRecommendation, confirmGateIn, resolveYardId } from '../services/gateInService';
+import type { GateInParams } from '../services/gateInService';
+import { fetchAndSetOccupancy } from '../services/containerPositionService';
+import { fetchAllYards } from '../services/yardService';
+import { processApiYards, setYardData } from '../store/yardStore';
+import { fetchWaitingContainers } from '../services/gateOutService';
+import type { WaitingItem } from '../services/gateOutService';
 import './Warehouse2D.css';
 
 // ─── Slot with tooltip ──────────────────────────────────────────────────────
@@ -120,9 +136,13 @@ function SlotGrid({ grid, color, emptyColor, highlighted, ghostPos, animDir, onC
   animDir?: 'left' | 'right' | null;
   onClickSlot?: (info: SlotInfo) => void;
 }) {
-  const rowGroups = [grid.slice(0, 2), grid.slice(2, 4)];
-  const leftPairs = [0, 2];
-  const rightPairs = [4, 6];
+  const rows     = grid.length || 4;
+  const cols     = grid[0]?.length ?? 8;
+  const midCol   = Math.floor(cols / 2);
+  const numGroups = Math.floor(rows / 2);
+  const rowGroups = Array.from({ length: numGroups }, (_, gi) => grid.slice(gi * 2, gi * 2 + 2));
+  const leftPairs  = Array.from({ length: Math.floor(midCol / 2) }, (_, i) => i * 2);
+  const rightPairs = Array.from({ length: Math.floor((cols - midCol) / 2) }, (_, i) => midCol + i * 2);
 
   const animClass = animDir === 'left' ? 'rack-slide-left' : animDir === 'right' ? 'rack-slide-right' : '';
 
@@ -164,8 +184,9 @@ function WHIcon({ type, size = 18 }: { type: WHType; size?: number }) {
 }
 
 // ─── Stat card ────────────────────────────────────────────────────────────────
-function StatCard({ wh }: { wh: WHConfig }) {
-  const stat = WH_STATS.find(s => s.id === wh.id);
+// Phase 2: stat is now passed from parent (from useDashboardStats) instead of
+// reading WH_STATS directly.
+function StatCard({ wh, stat }: { wh: WHConfig; stat?: WHStat }) {
   return (
     <div className="stat-card">
       <div className="stat-left">
@@ -235,19 +256,31 @@ function WarehouseCard({ wh, highlight, ghostPos, ghostZone, ghostFloor }: {
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [animDir, setAnimDir] = useState<'left' | 'right' | null>(null);
   const [selectedSlot, setSelectedSlot] = useState<SlotInfo | null>(null);
-  const grid = getGridForFloor(wh.id, ZONES[zoneIdx], floor);
+
+  // Phase 3+4: dynamic zone list and grid from yardStore / occupancyStore
+  const allYards     = useSyncExternalStore(subscribeYard, getYardData);
+  const occupancyMap = useSyncExternalStore(subscribeOccupancy, getOccupancyData);
+  const zones        = getZoneNames(allYards, wh.id);
+  const safeIdx      = Math.min(zoneIdx, zones.length - 1);
+  const currentZone  = zones[safeIdx] ?? '';
+
+  // Phase 4: use real occupancy grid per floor when loaded; fall back to mock seeded grid
+  const existenceGrid = getZoneGrid(allYards, wh.id, currentZone);
+  const grid = occupancyMap.size > 0
+    ? getOccupancyBoolGrid(occupancyMap, wh.id, currentZone, floor, existenceGrid)
+    : getZoneGridForFloor(allYards, wh.id, currentZone, floor); // Phase 3: mock seeded grid
 
   // Only show ghost on matching zone and floor
-  const showGhost = ghostPos && ghostZone === ZONES[zoneIdx] && ghostFloor === floor;
+  const showGhost = ghostPos && ghostZone === currentZone && ghostFloor === floor;
 
   const navigateZone = useCallback((dir: 'left' | 'right') => {
     setAnimDir(dir);
-    setZoneIdx((i) => dir === 'left'
-      ? (i - 1 + ZONES.length) % ZONES.length
-      : (i + 1) % ZONES.length
-    );
+    setZoneIdx((i) => {
+      const len = zones.length || 1;
+      return dir === 'left' ? (i - 1 + len) % len : (i + 1) % len;
+    });
     setTimeout(() => setAnimDir(null), 300);
-  }, []);
+  }, [zones.length]);
 
   const selectZone = useCallback((idx: number) => {
     setAnimDir('right');
@@ -272,14 +305,14 @@ function WarehouseCard({ wh, highlight, ghostPos, ghostZone, ghostFloor }: {
 
       <div className="wh-zone-wrap">
         <button className="wh-zone-selector" style={{ color: wh.color }} onClick={() => setDropdownOpen(!dropdownOpen)}>
-          {ZONES[zoneIdx]} <ChevronDown size={13} className={`wh-zone-chevron ${dropdownOpen ? 'wh-zone-chevron-open' : ''}`} />
+          {currentZone} <ChevronDown size={13} className={`wh-zone-chevron ${dropdownOpen ? 'wh-zone-chevron-open' : ''}`} />
         </button>
         {dropdownOpen && (
           <div className="wh-zone-dropdown">
-            {ZONES.map((z, i) => (
+            {zones.map((z, i) => (
               <button
                 key={z}
-                className={`wh-zone-option ${i === zoneIdx ? 'wh-zone-option-active' : ''}`}
+                className={`wh-zone-option ${i === safeIdx ? 'wh-zone-option-active' : ''}`}
                 style={{ '--wh-color': wh.color } as React.CSSProperties}
                 onClick={() => selectZone(i)}
               >
@@ -307,7 +340,7 @@ function WarehouseCard({ wh, highlight, ghostPos, ghostZone, ghostFloor }: {
           {floors.map((f) => (
             <button
               key={f}
-              className={`wh-floor-btn ${f === floor ? 'wh-floor-btn-active' : ''} ${ghostFloor === f && ghostZone === ZONES[zoneIdx] ? 'wh-floor-btn-ghost' : ''}`}
+              className={`wh-floor-btn ${f === floor ? 'wh-floor-btn-active' : ''} ${ghostFloor === f && ghostZone === currentZone ? 'wh-floor-btn-ghost' : ''}`}
               style={{ '--wh-color': wh.color } as React.CSSProperties}
               onClick={() => setFloor(f)}
             >
@@ -324,10 +357,24 @@ function WarehouseCard({ wh, highlight, ghostPos, ghostZone, ghostFloor }: {
 }
 
 // ─── Panels ───────────────────────────────────────────────────────────────────
-function WaitingListPanel({ onClose, onSelect }: {
+function WaitingListPanel({ onClose, onSelect, refreshKey }: {
   onClose: () => void;
   onSelect: (code: string) => void;
+  refreshKey?: number;
 }) {
+  const [items, setItems]     = useState<WaitingItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError]     = useState<string | null>(null);
+
+  useEffect(() => {
+    setLoading(true);
+    setError(null);
+    fetchWaitingContainers()
+      .then((data) => setItems(data))
+      .catch((e) => setError(e instanceof Error ? e.message : 'Lỗi tải danh sách'))
+      .finally(() => setLoading(false));
+  }, [refreshKey]);
+
   return (
     <div className="w2d-right-panel">
       <div className="rp-import-header">
@@ -335,10 +382,15 @@ function WaitingListPanel({ onClose, onSelect }: {
         <h2 className="rp-import-title">Container chờ nhập</h2>
       </div>
       <div className="rp-import-body">
-        {WAITING_CONTAINERS.map((ctn, idx) => (
-          <button key={idx} className="waiting-item" onClick={() => onSelect(ctn.code)}>
+        {loading && <p style={{ fontSize: '0.8rem', color: '#9ca3af', textAlign: 'center', padding: '1rem 0' }}>Đang tải...</p>}
+        {error   && <p style={{ fontSize: '0.8rem', color: '#f87171', textAlign: 'center', padding: '1rem 0' }}>{error}</p>}
+        {!loading && !error && items.length === 0 && (
+          <p style={{ fontSize: '0.8rem', color: '#9ca3af', textAlign: 'center', padding: '1rem 0' }}>Không có container đang chờ.</p>
+        )}
+        {items.map((ctn) => (
+          <button key={ctn.orderId} className="waiting-item" onClick={() => onSelect(ctn.containerCode)}>
             <div className="waiting-icon"><Truck size={18} /></div>
-            <span className="waiting-code">{ctn.code}</span>
+            <span className="waiting-code">{ctn.containerCode || `Order #${ctn.orderId}`}</span>
           </button>
         ))}
       </div>
@@ -365,62 +417,79 @@ function ImportPanel({ onClose, initialCode, onPreviewChange }: {
   const [manualWarehouse, setManualWH]   = useState('Kho Khô');
   const [manualFloor, setManualFloor]    = useState('1');
   const [manualPos, setManualPos]        = useState('CT01');
+  const [loading, setLoading]            = useState(false);
+  const [error, setError]               = useState<string | null>(null);
 
   useEffect(() => {
     return () => onPreviewChange(null);
   }, [onPreviewChange]);
 
-  function handleGetSuggestion() {
-    const sug = findSuggestedPosition(form.cargoType, form.sizeType);
-    setSuggestion(sug);
-    setStep('suggestion');
-
-    if (sug) {
-      setManualZone(sug.zone);
-      setManualWH(sug.whName);
-      setManualFloor(String(sug.floor));
-      setManualPos(sug.slot);
-      onPreviewChange({
-        whType: sug.whType,
-        zone: sug.zone,
-        floor: sug.floor,
-        row: sug.row,
-        col: sug.col,
-        sizeType: sug.sizeType,
-        containerCode: form.containerCode || 'Container mới',
-      });
+  // Phase 5: fetch recommendation from POST /admin/optimization/recommend
+  async function handleGetSuggestion() {
+    setLoading(true);
+    setError(null);
+    try {
+      const sug = await fetchRecommendation(form.cargoType, form.weight, form.sizeType);
+      setSuggestion(sug);
+      setStep('suggestion');
+      if (sug) {
+        setManualZone(sug.zone);
+        setManualWH(sug.whName);
+        setManualFloor(String(sug.floor));
+        setManualPos(sug.slot);
+        onPreviewChange({
+          whType: sug.whType,
+          zone: sug.zone,
+          floor: sug.floor,
+          row: sug.row,
+          col: sug.col,
+          sizeType: sug.sizeType,
+          containerCode: form.containerCode || 'Container mới',
+        });
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Lỗi kết nối');
+      setStep('suggestion');
+      setSuggestion(null);
+    } finally {
+      setLoading(false);
     }
   }
 
-  function handleConfirmImport() {
-    const whType = suggestion?.whType ?? cargoTypeToWHType(form.cargoType);
-    const whName = suggestion?.whName ?? cargoTypeToWHName(form.cargoType);
-    const zone = step === 'manual' ? manualZone : (suggestion?.zone ?? 'Zone A');
-    const floor = step === 'manual' ? parseInt(manualFloor) : (suggestion?.floor ?? 1);
-    const slot = step === 'manual' ? manualPos : (suggestion?.slot ?? 'R1C1');
+  // Phase 5 (fixed): gate-in → create container if needed → assign position
+  async function handleConfirmImport() {
+    const slotId = suggestion?.slotId;
+    if (!slotId) {
+      setError('Vui lòng lấy gợi ý vị trí trước khi xác nhận nhập kho');
+      return;
+    }
 
-    const today = new Date();
-    const dateStr = `${today.getDate().toString().padStart(2, '0')}/${(today.getMonth() + 1).toString().padStart(2, '0')}/${today.getFullYear()}`;
+    setLoading(true);
+    setError(null);
 
-    addImportedContainer({
-      code: form.containerCode || `CTN-${Date.now()}`,
-      cargoType: form.cargoType,
-      weight: form.weight,
-      whType,
-      whName,
-      zone,
-      floor,
-      row: suggestion?.row ?? 0,
-      col: suggestion?.col ?? 0,
-      slot,
-      sizeType: suggestion?.sizeType ?? form.sizeType,
-      importDate: dateStr,
-      exportDate: form.exportDate,
-      priority: form.priority,
-    });
+    const floor  = step === 'manual' ? parseInt(manualFloor) : (suggestion?.floor ?? 1);
+    const yardId = resolveYardId(suggestion?.whName ?? manualWarehouse, suggestion?.whType ?? '');
 
-    onPreviewChange(null);
-    onClose();
+    const params: GateInParams = {
+      containerCode: form.containerCode,
+      cargoType:     form.cargoType,
+      sizeType:      suggestion?.sizeType ?? form.sizeType,
+      weight:        form.weight,
+      exportDate:    form.exportDate,
+      priority:      form.priority,
+      yardId,
+      slotId,
+      tier:          floor,
+    };
+
+    try {
+      await confirmGateIn(params);
+      onPreviewChange(null);
+      onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Nhập kho thất bại');
+      setLoading(false);
+    }
   }
 
   function handleManualPositionChange(newZone: string, newFloor: string) {
@@ -448,6 +517,11 @@ function ImportPanel({ onClose, initialCode, onPreviewChange }: {
         <h2 className="rp-import-title">Nhập Container</h2>
       </div>
       <div className="rp-import-body">
+        {error && (
+          <p style={{ fontSize: '0.75rem', color: '#f87171', marginBottom: '0.5rem', padding: '0.5rem', background: '#fef2f2', borderRadius: '6px' }}>
+            {error}
+          </p>
+        )}
         {step === 'form' && (
           <>
             <div className="rp-field"><label>Mã số container</label>
@@ -494,8 +568,8 @@ function ImportPanel({ onClose, initialCode, onPreviewChange }: {
                 </select>
               </div>
             </div>
-            <button className="btn-primary rp-submit-btn" onClick={handleGetSuggestion}>
-              Nhận gợi ý vị trí
+            <button className="btn-primary rp-submit-btn" onClick={handleGetSuggestion} disabled={loading}>
+              {loading ? 'Đang tải...' : 'Nhận gợi ý vị trí'}
             </button>
           </>
         )}
@@ -530,9 +604,11 @@ function ImportPanel({ onClose, initialCode, onPreviewChange }: {
 
             {step === 'suggestion' && (
               <>
-                <button className="btn-primary rp-submit-btn" onClick={handleConfirmImport}>Xác nhận nhập</button>
-                <button className="rp-cancel-link" onClick={() => setStep('manual')}>Điều chỉnh thủ công</button>
-                <button className="rp-cancel-link" onClick={() => { onPreviewChange(null); onClose(); }}>Hủy</button>
+                <button className="btn-primary rp-submit-btn" onClick={handleConfirmImport} disabled={loading}>
+                  {loading ? 'Đang xử lý...' : 'Xác nhận nhập'}
+                </button>
+                <button className="rp-cancel-link" disabled={loading} onClick={() => setStep('manual')}>Điều chỉnh thủ công</button>
+                <button className="rp-cancel-link" disabled={loading} onClick={() => { onPreviewChange(null); onClose(); }}>Hủy</button>
               </>
             )}
 
@@ -558,7 +634,9 @@ function ImportPanel({ onClose, initialCode, onPreviewChange }: {
                   <input type="text" value={manualPos}
                     onChange={(e) => setManualPos(e.target.value)} />
                 </div>
-                <button className="btn-primary rp-submit-btn" onClick={handleConfirmImport}>Xác nhận nhập</button>
+                <button className="btn-primary rp-submit-btn" onClick={handleConfirmImport} disabled={loading}>
+                  {loading ? 'Đang xử lý...' : 'Xác nhận nhập'}
+                </button>
               </>
             )}
           </>
@@ -575,8 +653,28 @@ export function Warehouse2D() {
   const [panelMode, setPanelMode] = useState<PanelMode>(null);
   const [selectedCode, setCode]   = useState<string | undefined>(undefined);
   const [previewPosition, setPreviewPosition] = useState<PreviewPosition | null>(null);
+  const [isRefreshing, setIsRefreshing]       = useState(false);
+  const [waitingRefreshKey, setWaitingRefreshKey] = useState(0);
   function selectContainer(code: string) { setCode(code); setPanelMode('import'); }
   function closePanel() { setPanelMode(null); setCode(undefined); setPreviewPosition(null); }
+
+  // Phase 2: real occupancy stats from backend
+  const { stats: whStats, loading: statsLoading, error: statsError, refetch: refetchStats } = useDashboardStats();
+
+  async function handleRefresh() {
+    setIsRefreshing(true);
+    try {
+      const yards = await fetchAllYards();
+      setYardData(processApiYards(yards));
+      await fetchAndSetOccupancy(yards);
+      refetchStats();
+      if (panelMode === 'waiting-list') {
+        setWaitingRefreshKey(k => k + 1);
+      }
+    } finally {
+      setIsRefreshing(false);
+    }
+  }
 
   return (
     <DashboardLayout>
@@ -587,8 +685,16 @@ export function Warehouse2D() {
           <p className="w2d-subtitle">Xem tổng quan kho bãi và đường đi container</p>
         </div>
 
-        <div className="w2d-stat-row">
-          {WAREHOUSES.map((wh) => <StatCard key={wh.id} wh={wh} />)}
+        {/* Phase 2: real data from /admin/dashboard */}
+        <div className="w2d-stat-row" style={statsLoading ? { opacity: 0.6 } : undefined}>
+          {statsError && (
+            <p style={{ fontSize: '0.75rem', color: '#f87171', marginBottom: '0.25rem', width: '100%' }}>
+              Không thể tải dữ liệu ({statsError})
+            </p>
+          )}
+          {WAREHOUSES.map((wh) => (
+            <StatCard key={wh.id} wh={wh} stat={whStats.find(s => s.id === wh.id)} />
+          ))}
         </div>
 
         <div className="w2d-action-bar">
@@ -597,7 +703,7 @@ export function Warehouse2D() {
               <div className="ctn-card-icon"><Truck size={20} /></div>
               <div className="ctn-card-text">
                 <span className="ctn-card-label">Container chờ nhập kho</span>
-                <span className="ctn-card-sub">{WAITING_CONTAINERS.length} container đang chờ</span>
+                <span className="ctn-card-sub">Xem danh sách chờ</span>
               </div>
               <ChevronRight size={17} className="ctn-card-chevron" />
             </button>
@@ -609,6 +715,15 @@ export function Warehouse2D() {
           </div>
           <button className="btn-primary w2d-import-btn" onClick={() => setPanelMode('import')}>
             <Plus size={17} /><span>Nhập/Xuất</span>
+          </button>
+          <button
+            className="w2d-import-btn"
+            style={{ background: '#f3f4f6', color: '#374151', border: '1px solid #d1d5db' }}
+            onClick={handleRefresh}
+            disabled={isRefreshing}
+            title="Làm mới dữ liệu"
+          >
+            <RefreshCw size={17} className={isRefreshing ? 'refresh-spinning' : ''} /><span>Làm mới</span>
           </button>
         </div>
 
@@ -626,7 +741,7 @@ export function Warehouse2D() {
           </div>
 
           {panelMode === 'waiting-list' && (
-            <WaitingListPanel onClose={closePanel} onSelect={selectContainer} />
+            <WaitingListPanel onClose={closePanel} onSelect={selectContainer} refreshKey={waitingRefreshKey} />
           )}
           {panelMode === 'import' && (
             <ImportPanel onClose={closePanel} initialCode={selectedCode} onPreviewChange={setPreviewPosition} />

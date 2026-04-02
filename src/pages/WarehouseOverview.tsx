@@ -1,23 +1,31 @@
-import { useState, useRef, useEffect, useSyncExternalStore } from 'react';
+import { useState, useRef, useEffect, useCallback, useSyncExternalStore } from 'react';
 import {
   Search, Plus, ChevronLeft, ChevronRight, ZoomIn, ZoomOut, Compass,
   Package, Calendar, Truck, Snowflake, AlertTriangle, Layers, Info,
-  LogOut,
+  LogOut, RefreshCw,
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { DashboardLayout } from '../components/layout/DashboardLayout';
 import { OverviewScene } from '../components/3d/OverviewScene';
 import type { OverviewSceneHandle } from '../components/3d/OverviewScene';
 import { Legend } from '../components/ui/Legend';
-import {
-  WH_STATS, WAITING_CONTAINERS, EXPORT_CONTAINERS,
-} from '../data/warehouse';
+// Phase 2: WH_STATS replaced by useDashboardStats hook
+// Phase 6: WAITING_CONTAINERS, EXPORT_CONTAINERS replaced by gateOutService
 import type { WHType, ZoneInfo, WHStat, PreviewPosition } from '../data/warehouse';
+import { useDashboardStats } from '../hooks/useDashboardStats';
 import {
-  findSuggestedPosition, addImportedContainer,
   subscribe, getImportedContainers, cargoTypeToWHType, cargoTypeToWHName,
 } from '../data/containerStore';
 import type { SuggestedPosition } from '../data/containerStore';
+import { fetchRecommendation, confirmGateIn, resolveYardId } from '../services/gateInService';
+import type { GateInParams } from '../services/gateInService';
+import { fetchAndSetOccupancy } from '../services/containerPositionService';
+import { fetchAllYards } from '../services/yardService';
+import { processApiYards, setYardData } from '../store/yardStore';
+import {
+  searchInYardContainers, performGateOut, fetchWaitingContainers,
+} from '../services/gateOutService';
+import type { InYardContainer, WaitingItem } from '../services/gateOutService';
 import './WarehouseOverview.css';
 
 // ─── Icons ────────────────────────────────────────────────────────────────────
@@ -103,24 +111,45 @@ function ZoneInfoPanel({ zone }: { zone: ZoneInfo }) {
 }
 
 // ─── Waiting list panel ──────────────────────────────────────────────────────
-function WaitingListPanel({ onClose, onSelect }: {
+function WaitingListPanel({ onClose, onSelect, refreshKey }: {
   onClose: () => void;
   onSelect: (code: string) => void;
+  refreshKey?: number;
 }) {
+  const [containers, setContainers] = useState<WaitingItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    fetchWaitingContainers()
+      .then((list) => { if (!cancelled) setContainers(list); })
+      .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : 'Lỗi tải dữ liệu'); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [refreshKey]);
+
   return (
     <div className="ov-right-panel">
       <div className="ov-rp-panel-header">
         <button className="ov-rp-back-btn" onClick={onClose}><ChevronLeft size={18} /></button>
         <h2 className="ov-rp-panel-title">Container chờ nhập</h2>
-        <span className="ov-rp-badge">{WAITING_CONTAINERS.length}</span>
+        {!loading && !error && <span className="ov-rp-badge">{containers.length}</span>}
       </div>
       <div className="ov-rp-panel-body">
-        {WAITING_CONTAINERS.map((ctn, idx) => (
-          <button key={idx} className="ov-waiting-item" onClick={() => onSelect(ctn.code)}>
+        {loading && <p className="ov-rp-empty">Đang tải...</p>}
+        {error && <p className="ov-rp-empty" style={{ color: '#f87171' }}>{error}</p>}
+        {!loading && !error && containers.length === 0 && (
+          <p className="ov-rp-empty">Không có container đang chờ nhập</p>
+        )}
+        {!loading && !error && containers.map((ctn) => (
+          <button key={ctn.orderId} className="ov-waiting-item" onClick={() => onSelect(ctn.containerCode)}>
             <div className="ov-waiting-icon"><Truck size={18} /></div>
             <div className="ov-waiting-info">
-              <span className="ov-waiting-code">{ctn.code}</span>
-              <span className="ov-waiting-meta">{ctn.type} &middot; {ctn.date}</span>
+              <span className="ov-waiting-code">{ctn.containerCode}</span>
+              <span className="ov-waiting-meta">{ctn.cargoType} &middot; {ctn.orderDate}</span>
             </div>
             <ChevronRight size={16} className="ov-waiting-chevron" />
           </button>
@@ -136,21 +165,56 @@ type ExportStep = 'search' | 'confirm';
 function ExportPanel({ onClose }: { onClose: () => void }) {
   const [step, setStep] = useState<ExportStep>('search');
   const [searchCode, setSearchCode] = useState('');
-  const [selectedExport, setSelectedExport] = useState<typeof EXPORT_CONTAINERS[0] | null>(null);
+  const [containers, setContainers] = useState<InYardContainer[]>([]);
+  const [fetchLoading, setFetchLoading] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [selectedExport, setSelectedExport] = useState<InYardContainer | null>(null);
+  const [gateOutLoading, setGateOutLoading] = useState(false);
+  const [gateOutError, setGateOutError] = useState<string | null>(null);
 
-  const filtered = searchCode.trim()
-    ? EXPORT_CONTAINERS.filter(c => c.code.toLowerCase().includes(searchCode.toLowerCase()))
-    : EXPORT_CONTAINERS;
+  // Fetch IN_YARD containers, debounced on searchCode
+  const doSearch = useCallback((keyword: string) => {
+    setFetchLoading(true);
+    setFetchError(null);
+    searchInYardContainers(keyword)
+      .then(setContainers)
+      .catch((e) => setFetchError(e instanceof Error ? e.message : 'Lỗi tải dữ liệu'))
+      .finally(() => setFetchLoading(false));
+  }, []);
 
-  function selectForExport(ctn: typeof EXPORT_CONTAINERS[0]) {
+  useEffect(() => {
+    doSearch('');
+  }, [doSearch]);
+
+  useEffect(() => {
+    const t = setTimeout(() => doSearch(searchCode), 300);
+    return () => clearTimeout(t);
+  }, [searchCode, doSearch]);
+
+  function selectForExport(ctn: InYardContainer) {
     setSelectedExport(ctn);
+    setGateOutError(null);
     setStep('confirm');
+  }
+
+  async function handleConfirmGateOut() {
+    if (!selectedExport) return;
+    setGateOutLoading(true);
+    setGateOutError(null);
+    try {
+      await performGateOut(selectedExport.containerId);
+      setContainers((prev) => prev.filter((c) => c.containerId !== selectedExport.containerId));
+      onClose();
+    } catch (e) {
+      setGateOutError(e instanceof Error ? e.message : 'Xuất kho thất bại');
+      setGateOutLoading(false);
+    }
   }
 
   return (
     <div className="ov-right-panel">
       <div className="ov-rp-panel-header">
-        <button className="ov-rp-back-btn" onClick={step === 'confirm' ? () => setStep('search') : onClose}>
+        <button className="ov-rp-back-btn" onClick={step === 'confirm' ? () => { setStep('search'); setGateOutError(null); } : onClose}>
           <ChevronLeft size={18} />
         </button>
         <h2 className="ov-rp-panel-title">Xuất Container</h2>
@@ -170,18 +234,21 @@ function ExportPanel({ onClose }: { onClose: () => void }) {
                 />
               </div>
             </div>
-            <div className="ov-rp-list-label">Container trong kho ({filtered.length})</div>
-            {filtered.map((ctn, idx) => (
-              <button key={idx} className="ov-waiting-item" onClick={() => selectForExport(ctn)}>
+            {fetchError && <p className="ov-rp-empty" style={{ color: '#f87171' }}>{fetchError}</p>}
+            <div className="ov-rp-list-label">
+              Container trong kho {fetchLoading ? '(đang tải...)' : `(${containers.length})`}
+            </div>
+            {!fetchLoading && containers.map((ctn) => (
+              <button key={ctn.containerId} className="ov-waiting-item" onClick={() => selectForExport(ctn)}>
                 <div className="ov-waiting-icon ov-export-icon"><LogOut size={18} /></div>
                 <div className="ov-waiting-info">
-                  <span className="ov-waiting-code">{ctn.code}</span>
-                  <span className="ov-waiting-meta">{ctn.type} &middot; {ctn.zone}</span>
+                  <span className="ov-waiting-code">{ctn.containerCode}</span>
+                  <span className="ov-waiting-meta">{ctn.cargoType} &middot; {ctn.zone}</span>
                 </div>
                 <ChevronRight size={16} className="ov-waiting-chevron" />
               </button>
             ))}
-            {filtered.length === 0 && (
+            {!fetchLoading && !fetchError && containers.length === 0 && (
               <p className="ov-rp-empty">Không tìm thấy container</p>
             )}
           </>
@@ -189,6 +256,11 @@ function ExportPanel({ onClose }: { onClose: () => void }) {
 
         {step === 'confirm' && selectedExport && (
           <>
+            {gateOutError && (
+              <div className="ov-rp-error-banner" style={{ color: '#f87171', fontSize: '0.8rem', marginBottom: '0.75rem' }}>
+                {gateOutError}
+              </div>
+            )}
             <div className="ov-rp-suggestion-card">
               <div className="ov-rp-sug-header">
                 <div className="ov-rp-sug-icon"><LogOut size={16} /></div>
@@ -196,16 +268,16 @@ function ExportPanel({ onClose }: { onClose: () => void }) {
               </div>
               <div className="ov-rp-sug-row">
                 <span className="ov-rp-sug-label">Mã container</span>
-                <span className="ov-rp-sug-value ov-rp-blue">{selectedExport.code}</span>
+                <span className="ov-rp-sug-value ov-rp-blue">{selectedExport.containerCode}</span>
               </div>
               <div className="ov-rp-sug-row">
                 <span className="ov-rp-sug-label">Loại hàng</span>
-                <span className="ov-rp-sug-value">{selectedExport.type}</span>
+                <span className="ov-rp-sug-value">{selectedExport.cargoType}</span>
               </div>
               <div className="ov-rp-sug-row">
                 <span className="ov-rp-sug-label">Vị trí hiện tại</span>
                 <span className="ov-rp-sug-value ov-rp-blue">
-                  {selectedExport.zone} - {selectedExport.wh}<br />
+                  {selectedExport.zone} - {selectedExport.whName}<br />
                   Tầng {selectedExport.floor} - {selectedExport.slot}
                 </span>
               </div>
@@ -230,10 +302,14 @@ function ExportPanel({ onClose }: { onClose: () => void }) {
               <input type="text" placeholder="Nhập ghi chú (tùy chọn)..." className="ov-rp-input" />
             </div>
 
-            <button className="btn-primary ov-rp-submit-btn" onClick={onClose}>
-              Xác nhận xuất kho
+            <button
+              className="btn-primary ov-rp-submit-btn"
+              onClick={handleConfirmGateOut}
+              disabled={gateOutLoading}
+            >
+              {gateOutLoading ? 'Đang xử lý...' : 'Xác nhận xuất kho'}
             </button>
-            <button className="ov-rp-cancel-link" onClick={() => setStep('search')}>Quay lại</button>
+            <button className="ov-rp-cancel-link" onClick={() => { setStep('search'); setGateOutError(null); }}>Quay lại</button>
           </>
         )}
       </div>
@@ -263,66 +339,81 @@ function ImportPanel({ onClose, initialCode, onPreviewChange }: {
   const [manualWarehouse, setManualWH]   = useState('Kho Khô');
   const [manualFloor, setManualFloor]    = useState('1');
   const [manualPos, setManualPos]        = useState('CT01');
+  const [loading, setLoading]            = useState(false);
+  const [error, setError]               = useState<string | null>(null);
 
   // Clear preview on unmount
   useEffect(() => {
     return () => onPreviewChange(null);
   }, [onPreviewChange]);
 
-  function handleGetSuggestion() {
-    const sug = findSuggestedPosition(form.cargoType, form.sizeType);
-    setSuggestion(sug);
-    setStep('suggestion');
+  // Phase 5: fetch recommendation from POST /admin/optimization/recommend
+  async function handleGetSuggestion() {
+    setLoading(true);
+    setError(null);
+    try {
+      const sug = await fetchRecommendation(form.cargoType, form.weight, form.sizeType);
+      setSuggestion(sug);
+      setStep('suggestion');
 
-    if (sug) {
-      setManualZone(sug.zone);
-      setManualWH(sug.whName);
-      setManualFloor(String(sug.floor));
-      setManualPos(sug.slot);
-      // Show ghost preview in 3D/2D
-      onPreviewChange({
-        whType: sug.whType,
-        zone: sug.zone,
-        floor: sug.floor,
-        row: sug.row,
-        col: sug.col,
-        sizeType: sug.sizeType,
-        containerCode: form.containerCode || 'Container mới',
-      });
+      if (sug) {
+        setManualZone(sug.zone);
+        setManualWH(sug.whName);
+        setManualFloor(String(sug.floor));
+        setManualPos(sug.slot);
+        onPreviewChange({
+          whType: sug.whType,
+          zone: sug.zone,
+          floor: sug.floor,
+          row: sug.row,
+          col: sug.col,
+          sizeType: sug.sizeType,
+          containerCode: form.containerCode || 'Container mới',
+        });
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Lỗi kết nối');
+      setStep('suggestion');
+      setSuggestion(null);
+    } finally {
+      setLoading(false);
     }
   }
 
-  function handleConfirmImport() {
-    const whType = suggestion?.whType ?? cargoTypeToWHType(form.cargoType);
-    const whName = suggestion?.whName ?? cargoTypeToWHName(form.cargoType);
-    const zone = step === 'manual' ? manualZone : (suggestion?.zone ?? 'Zone A');
-    const floor = step === 'manual' ? parseInt(manualFloor) : (suggestion?.floor ?? 1);
-    const row = suggestion?.row ?? 0;
-    const col = suggestion?.col ?? 0;
-    const slot = step === 'manual' ? manualPos : (suggestion?.slot ?? 'R1C1');
+  // Phase 5 (fixed): gate-in → create container if needed → assign position
+  async function handleConfirmImport() {
+    const slotId = suggestion?.slotId;
+    if (!slotId) {
+      setError('Vui lòng lấy gợi ý vị trí trước khi xác nhận nhập kho');
+      return;
+    }
 
-    const today = new Date();
-    const dateStr = `${today.getDate().toString().padStart(2, '0')}/${(today.getMonth() + 1).toString().padStart(2, '0')}/${today.getFullYear()}`;
+    setLoading(true);
+    setError(null);
 
-    addImportedContainer({
-      code: form.containerCode || `CTN-${Date.now()}`,
-      cargoType: form.cargoType,
-      weight: form.weight,
-      whType,
-      whName,
-      zone,
-      floor,
-      row,
-      col,
-      slot,
-      sizeType: suggestion?.sizeType ?? form.sizeType,
-      importDate: dateStr,
-      exportDate: form.exportDate,
-      priority: form.priority,
-    });
+    const floor  = step === 'manual' ? parseInt(manualFloor) : (suggestion?.floor ?? 1);
+    const yardId = resolveYardId(suggestion?.whName ?? manualWarehouse, suggestion?.whType ?? '');
 
-    onPreviewChange(null);
-    onClose();
+    const params: GateInParams = {
+      containerCode: form.containerCode,
+      cargoType:     form.cargoType,
+      sizeType:      suggestion?.sizeType ?? form.sizeType,
+      weight:        form.weight,
+      exportDate:    form.exportDate,
+      priority:      form.priority,
+      yardId,
+      slotId,
+      tier:          floor,
+    };
+
+    try {
+      await confirmGateIn(params);
+      onPreviewChange(null);
+      onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Nhập kho thất bại');
+      setLoading(false);
+    }
   }
 
   function handleManualPositionChange(newZone: string, newFloor: string) {
@@ -350,6 +441,9 @@ function ImportPanel({ onClose, initialCode, onPreviewChange }: {
         <h2 className="ov-rp-panel-title">Nhập Container</h2>
       </div>
       <div className="ov-rp-panel-body">
+        {error && (
+          <div style={{ color: '#f87171', fontSize: '0.8rem', marginBottom: '0.75rem' }}>{error}</div>
+        )}
         {step === 'form' && (
           <>
             <div className="ov-rp-field">
@@ -404,8 +498,8 @@ function ImportPanel({ onClose, initialCode, onPreviewChange }: {
                 </select>
               </div>
             </div>
-            <button className="btn-primary ov-rp-submit-btn" onClick={handleGetSuggestion}>
-              Nhận gợi ý vị trí
+            <button className="btn-primary ov-rp-submit-btn" onClick={handleGetSuggestion} disabled={loading}>
+              {loading ? 'Đang tải...' : 'Nhận gợi ý vị trí'}
             </button>
           </>
         )}
@@ -445,11 +539,11 @@ function ImportPanel({ onClose, initialCode, onPreviewChange }: {
 
             {step === 'suggestion' && (
               <>
-                <button className="btn-primary ov-rp-submit-btn" onClick={handleConfirmImport}>
-                  Xác nhận nhập
+                <button className="btn-primary ov-rp-submit-btn" onClick={handleConfirmImport} disabled={loading}>
+                  {loading ? 'Đang xử lý...' : 'Xác nhận nhập'}
                 </button>
-                <button className="ov-rp-cancel-link" onClick={() => setStep('manual')}>Điều chỉnh thủ công</button>
-                <button className="ov-rp-cancel-link" onClick={() => { onPreviewChange(null); onClose(); }}>Hủy</button>
+                <button className="ov-rp-cancel-link" onClick={() => setStep('manual')} disabled={loading}>Điều chỉnh thủ công</button>
+                <button className="ov-rp-cancel-link" onClick={() => { onPreviewChange(null); onClose(); }} disabled={loading}>Hủy</button>
               </>
             )}
 
@@ -475,7 +569,9 @@ function ImportPanel({ onClose, initialCode, onPreviewChange }: {
                   <input type="text" value={manualPos}
                     onChange={(e) => setManualPos(e.target.value)} className="ov-rp-input" />
                 </div>
-                <button className="btn-primary ov-rp-submit-btn" onClick={handleConfirmImport}>Xác nhận nhập</button>
+                <button className="btn-primary ov-rp-submit-btn" onClick={handleConfirmImport} disabled={loading}>
+                  {loading ? 'Đang xử lý...' : 'Xác nhận nhập'}
+                </button>
               </>
             )}
           </>
@@ -494,8 +590,13 @@ export function WarehouseOverview() {
   const [selectedCode, setSelectedCode]  = useState<string | undefined>(undefined);
   const [searchTerm, setSearchTerm]      = useState('');
   const [previewPosition, setPreviewPosition] = useState<PreviewPosition | null>(null);
+  const [isRefreshing, setIsRefreshing]       = useState(false);
+  const [waitingRefreshKey, setWaitingRefreshKey] = useState(0);
   const sceneRef = useRef<OverviewSceneHandle>(null);
   const navigate = useNavigate();
+
+  // Phase 2: real occupancy stats from backend
+  const { stats: whStats, loading: statsLoading, error: statsError, refetch: refetchStats } = useDashboardStats();
 
   function handleZoneClick(zone: ZoneInfo) {
     setSelectedZone(zone);
@@ -523,6 +624,21 @@ export function WarehouseOverview() {
     navigate(`/3d?wh=${whId}`);
   }
 
+  async function handleRefresh() {
+    setIsRefreshing(true);
+    try {
+      const yards = await fetchAllYards();
+      setYardData(processApiYards(yards));
+      await fetchAndSetOccupancy(yards);
+      refetchStats();
+      if (panelMode === 'waiting-list') {
+        setWaitingRefreshKey(k => k + 1);
+      }
+    } finally {
+      setIsRefreshing(false);
+    }
+  }
+
   return (
     <DashboardLayout>
       <div className="ov-page">
@@ -533,9 +649,14 @@ export function WarehouseOverview() {
           <p className="ov-subtitle">Xem tổng quan tất cả kho bãi: Kho Lạnh, Kho Khô, Kho Hàng dễ vỡ, Kho Khác</p>
         </div>
 
-        {/* ── Stat cards ── */}
-        <div className="ov-stat-row">
-          {WH_STATS.map((wh) => (
+        {/* ── Stat cards (Phase 2: real data from /admin/dashboard) ── */}
+        <div className="ov-stat-row" style={statsLoading ? { opacity: 0.6 } : undefined}>
+          {statsError && (
+            <p style={{ fontSize: '0.75rem', color: '#f87171', marginBottom: '0.25rem', width: '100%' }}>
+              Không thể tải dữ liệu thống kê ({statsError}) — hiển thị dữ liệu dự phòng
+            </p>
+          )}
+          {whStats.map((wh) => (
             <StatCard key={wh.id} wh={wh} onClick={() => navigateToWarehouse(wh.id)} />
           ))}
         </div>
@@ -547,7 +668,7 @@ export function WarehouseOverview() {
               <div className="ov-ctn-card-icon"><Truck size={20} /></div>
               <div className="ov-ctn-card-text">
                 <span className="ov-ctn-card-label">Container chờ nhập kho</span>
-                <span className="ov-ctn-card-sub">{WAITING_CONTAINERS.length} container đang chờ</span>
+                <span className="ov-ctn-card-sub">Xem danh sách chờ</span>
               </div>
               <ChevronRight size={17} className="ov-ctn-card-chevron" />
             </button>
@@ -563,6 +684,15 @@ export function WarehouseOverview() {
           </button>
           <button className="ov-export-btn" onClick={() => setPanelMode('export')}>
             <LogOut size={17} /><span>Xuất kho</span>
+          </button>
+          <button
+            className="ov-export-btn"
+            style={{ background: '#f3f4f6', color: '#374151', border: '1px solid #d1d5db' }}
+            onClick={handleRefresh}
+            disabled={isRefreshing}
+            title="Làm mới dữ liệu"
+          >
+            <RefreshCw size={17} className={isRefreshing ? 'refresh-spinning' : ''} /><span>Làm mới</span>
           </button>
         </div>
 
@@ -581,7 +711,7 @@ export function WarehouseOverview() {
 
           {panelMode === 'zone' && selectedZone && <ZoneInfoPanel zone={selectedZone} />}
           {panelMode === 'waiting-list' && (
-            <WaitingListPanel onClose={closePanel} onSelect={selectContainer} />
+            <WaitingListPanel onClose={closePanel} onSelect={selectContainer} refreshKey={waitingRefreshKey} />
           )}
           {panelMode === 'import' && (
             <ImportPanel onClose={closePanel} initialCode={selectedCode} onPreviewChange={setPreviewPosition} />
